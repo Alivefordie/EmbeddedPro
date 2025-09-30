@@ -4,15 +4,31 @@ import cv2
 import math
 from ultralytics import YOLO
 import torch
+import time
+import serial
+
+# ==== Serial to boat MCU (Bluetooth) ====
+PORT = "COM10"  # ปรับตามเครื่องคุณ (Linux/Mac ใช้ /dev/tty.*)
+BAUD = 115200
+TIMEOUT_S = 0.05
+
+# ser = serial.Serial(PORT, BAUD, timeout=TIMEOUT_S)
+last_send = 0.0
+SEND_HZ = 10.0  # จำกัดความถี่ส่งคำสั่ง ~10 Hz
+MAX_PWM = 255  # ต้องไม่เกิน MAX_PWM ที่ฝั่ง MCU
+FWD_PWM_BASE = 130  # ความแรงเดินหน้าเริ่มต้น
+ROT_PWM_BASE = 120  # ความแรงหมุนเริ่มต้น
+K_ROT = 1.0  # สเกล PWM ตามขนาด error องศา
+ANGLE_TOL_DEG = 8.0  # ยอมให้เอียงได้เท่านี้แล้วเดินหน้า
+STOP_DIST_M = 0.05  # ระยะหยุด (เมตร) เมื่อถึงเป้าหมาย
+
 
 # 1) Pick device automatically: CUDA if available (your RTX 1650), else CPU
 device = 0 if torch.cuda.is_available() else "cpu"
 
 # 2) Load a small pretrained model (auto-downloads on first run)
-model = YOLO(
-    "./runs/rubberduck-11s-tune-small-T4-2/weights/best.pt"
-)  # 'n' = nano, fastest
-clicks = [(237, 346), (250, 135), (512, 166), (516, 403)]
+model = YOLO("./best.pt")  # 'n' = nano, fastest
+clicks = [(20, 454), (224, 129), (768, 119), (632, 485)]
 boat_cx, boat_cy = -1, -1  # เริ่มต้นยังไม่รู้ตำแหน่งเรือ
 H = None  # matrix แปลงมุมมอง
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -24,55 +40,198 @@ STEP_PX = int(round(STEP_M * PX_PER_M))
 BEV_W = int(round(REAL_W * PX_PER_M))
 BEV_H = int(round(REAL_H * PX_PER_M))
 
+# --- state สำหรับเก็บ "จุดหมาย" ---
+target_bev_px = (662.9, 509.9)  # (xw, yw) บน BEV (px)
+target_bev_m = (2.21, 1.70)  # (Xm, Ym) บน BEV (m)
 
-def duck_detector(frame):
-    duck_frame = frame.copy()
+
+# def clamp_pwm(v):
+#     return max(0, min(int(round(v)), MAX_PWM))
+
+
+# def rate_limited_send(cmd):
+#     global last_send
+#     t = time.time()
+#     if t - last_send >= (1.0 / SEND_HZ):
+#         ser.write((cmd + "\n").encode("utf-8"))
+#         last_send = t
+
+
+# def send_stop():
+#     print("STOP")
+#     rate_limited_send("S-0")
+
+
+# def send_forward(p):
+#     print(f"FWD {p}")
+#     rate_limited_send(f"F-{clamp_pwm(p)}")
+
+
+# def send_left(p):
+#     print(f"LEFT {p}")
+#     rate_limited_send(f"L-{clamp_pwm(p)}")  # หมุนซ้ายอยู่กับที่
+
+
+# def send_right(p):
+#     print(f"RIGHT {p}")
+#     rate_limited_send(f"R-{clamp_pwm(p)}")  # หมุนขวาอยู่กับที่
+
+
+# def ang_wrap_deg(a):
+#     # ให้อยู่ช่วง (-180, 180]
+#     while a <= -180.0:
+#         a += 360.0
+#     while a > 180.0:
+#         a -= 360.0
+#     return a
+
+
+# def bearing_deg(src_px, dst_px):
+#     # ทั้ง src,dst เป็นพิกัด BEV (px) แกน y ลง, ใช้ atan2(dy,dx) แบบเดียวกับ yaw ที่คุณคำนวณ
+#     dx = dst_px[0] - src_px[0]
+#     dy = dst_px[1] - src_px[1]
+#     return math.degrees(math.atan2(dy, dx))
+
+
+# def dist_m_px(a_px, b_px, px_per_m=PX_PER_M):
+#     dx = (a_px[0] - b_px[0]) / px_per_m
+#     dy = (a_px[1] - b_px[1]) / px_per_m
+#     return (dx * dx + dy * dy) ** 0.5
+
+
+# def autopilot_step(head_xy_bev, tail_xy_bev, yaw_deg, target_bev_px):
+#     """
+#     head_xy_bev, tail_xy_bev: tuple(int,int) พิกัด BEV (px)
+#     yaw_deg: องศาหัวเรือ (จาก tail -> head) เช่น yaw_ema ของคุณ
+#     target_bev_px: จุดหมาย sticky target บน BEV (px) หรือ None
+#     """
+#     # ถ้าไม่มีข้อมูลครบนิ่ง → หยุด
+#     if (
+#         target_bev_px is None
+#         or head_xy_bev is None
+#         or tail_xy_bev is None
+#         or yaw_deg is None
+#     ):
+#         send_stop()
+#         return
+
+#     # ระยะถึงเป้าหมาย
+#     dist = dist_m_px(tail_xy_bev, target_bev_px, PX_PER_M)
+#     if dist < STOP_DIST_M:
+#         send_stop()
+#         return
+
+#     # มุมที่ควรเผชิญหน้า (bearing) และ error
+#     bearing = bearing_deg(tail_xy_bev, target_bev_px)
+#     err = ang_wrap_deg(bearing - yaw_deg)
+
+#     # ถ้าเอียงมาก → หมุนอยู่กับที่
+#     if abs(err) > ANGLE_TOL_DEG:
+#         pwm = ROT_PWM_BASE + K_ROT * abs(err)  # เพิ่มแรงตาม error
+#         if err > 0:  # ต้องหมุนทวนเข็ม (yaw ต้องเพิ่ม) → สั่ง Left
+#             send_left(pwm)
+#         else:  # ต้องหมุนตามเข็ม (yaw ต้องลด)   → สั่ง Right
+#             send_right(pwm)
+#         return
+
+#     # ถ้าเผชิญหน้าพอแล้ว → เดินหน้า
+#     send_forward(FWD_PWM_BASE)
+
+
+def duck_detector(frame, H, BEV_W, BEV_H, px_per_m=PX_PER_M, cls_whitelist=None):
+    """
+    ตรวจ 'เป็ด' บน ORIGINAL → เลือก 1 กล่องที่ conf สูงสุด
+    - ถ้าเจอ: คำนวณ centroid → project เป็น BEV → อัปเดต target_* (sticky)
+    - ถ้าไม่เจอ: คง target_* เดิมไว้ (ไม่อัปเดต)
+    คืนค่า: annotated_original, duck_xy_img, duck_xy_bev(หรือ None), duck_xy_m(หรือ None)
+    """
+    global target_bev_px, target_bev_m
+
     results = model.predict(
         source=frame, conf=0.40, imgsz=640, device=device, verbose=False
     )
-    # 5) Draw boxes/labels onto the frame
-    annotated = results[0].plot()
-    return annotated
-
-
-def detect_duck_targets(frame_bgr, model, conf_th=0.40):
-    """
-    Returns: list[ dict(x,y,w,h,cx,cy,cls_name,conf) ], and an annotated image
-    Compatible with Ultralytics YOLOv8/YOLOv5 results API.
-    """
-    results = model.predict(
-        source=frame_bgr, conf=conf_th, imgsz=640, device=device, verbose=False
-    )
     r = results[0]
-    boxes = r.boxes  # xyxy, conf, cls
-    names = getattr(r, "names", getattr(model, "names", {}))  # id->name dict
+    annotated = r.plot()
 
-    dets = []
-    if boxes is not None and len(boxes) > 0:
-        xyxy = boxes.xyxy.cpu().numpy()
-        conf = boxes.conf.cpu().numpy()
-        cls = boxes.cls.cpu().numpy().astype(int)
+    # ไม่มี detection → ไม่รีเซ็ต เป้าหมายเดิม
+    if r.boxes is None or r.boxes.shape[0] == 0:
+        return annotated, None, None, None
 
-        for (x1, y1, x2, y2), c, k in zip(xyxy, conf, cls):
-            name = names.get(k, str(k))
-            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-            w, h = x2 - x1, y2 - y1
-            cx, cy = x1 + w // 2, y1 + h // 2
-            dets.append(
-                {
-                    "x": x1,
-                    "y": y1,
-                    "w": w,
-                    "h": h,
-                    "cx": cx,
-                    "cy": cy,
-                    "cls_name": name,
-                    "conf": float(c),
-                }
-            )
+    # กรองด้วย whitelist ถ้ามี
+    keep = list(range(len(r.boxes)))
+    if cls_whitelist is not None:
+        cls = r.boxes.cls.int().cpu().tolist()
+        keep = [i for i, c in enumerate(cls) if c in cls_whitelist]
+        if not keep:
+            return annotated, None, None, None
 
-    annotated = r.plot()  # YOLO’s nice overlay
-    return dets, annotated
+    # เลือกกล่อง conf สูงสุด
+    conf = r.boxes.conf.cpu().numpy()
+    best = max(keep, key=lambda i: conf[i])
+
+    # centroid บน ORIGINAL
+    x1, y1, x2, y2 = r.boxes.xyxy[best].cpu().numpy().tolist()
+    cx = float((x1 + x2) * 0.5)
+    cy = float((y1 + y2) * 0.5)
+    cv2.circle(annotated, (int(round(cx)), int(round(cy))), 6, (0, 255, 255), -1)
+    cv2.putText(
+        annotated,
+        "DUCK",
+        (int(x1), max(0, int(y1) - 6)),
+        FONT,
+        0.6,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # project → BEV
+    if H is None:
+        return annotated, (cx, cy), None, None
+
+    pt = np.array([[[cx, cy]]], dtype=np.float32)
+    xw, yw = cv2.perspectiveTransform(pt, H)[0, 0]
+    # ในกรอบ BEV ไหม
+    if not (0.0 <= xw < BEV_W and 0.0 <= yw < BEV_H):
+        # ถ้ากล่องหลุดขอบ BEV ให้ “ไม่อัปเดต” เป้าหมาย (ยังใช้ค่าก่อนหน้า)
+        return annotated, (cx, cy), None, None
+
+    Xm, Ym = xw / px_per_m, yw / px_per_m
+
+    # --- อัปเดต Sticky Target ---
+    target_bev_px = (xw, yw)
+    target_bev_m = (Xm, Ym)
+
+    return annotated, (cx, cy), (xw, yw), (Xm, Ym)
+
+
+def draw_sticky_target_on_bev(bev_img):
+    """วาดจุดหมายล่าสุด (ถ้ามี) ลงบนภาพ BEV โดยไม่วาด trail"""
+    if target_bev_px is None or target_bev_m is None:
+        return bev_img
+    xw, yw = target_bev_px
+    Xm, Ym = target_bev_m
+    out = bev_img.copy()
+    cv2.drawMarker(
+        out,
+        (int(round(xw)), int(round(yw))),
+        (0, 0, 255),
+        markerType=cv2.MARKER_TILTED_CROSS,
+        markerSize=20,
+        thickness=3,
+    )
+    print(f"Target BEV: ({xw:.1f},{yw:.1f}) px  ({Xm:.2f},{Ym:.2f}) m")
+    cv2.putText(
+        out,
+        f"Tgt BEV({xw:.1f},{yw:.1f})  W({Xm:.2f},{Ym:.2f})m",
+        (int(round(xw)) + 10, max(18, int(round(yw)) - 10)),
+        FONT,
+        0.6,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
 
 
 def order_points(pts):
@@ -325,8 +484,11 @@ def process_frame(image, BEV, BEV_W, BEV_H):
     else:
         warped = BEV
 
-    lower_head, upper_head = bgr_to_hsv_range(head_colour, tol)
-    lower_tail, upper_tail = bgr_to_hsv_range(tail_colour, tol)
+    lower_head, upper_head = bgr_to_hsv_range(head_colour, tol=(10, 60, 60))
+    lower_tail, upper_tail = bgr_to_hsv_range(tail_colour, tol=(10, 60, 60))
+
+    # lower_head, upper_head = bgr_to_hsv_range(head_colour, tol)
+    # lower_tail, upper_tail = bgr_to_hsv_range(tail_colour, tol)
 
     # 2) detect markers บน BEV
     mask_head = mask_hsv(warped, lower_head, upper_head)  # หัวเรือ (แดง)
@@ -411,6 +573,16 @@ def process_frame(image, BEV, BEV_W, BEV_H):
     # หรือจะ detect บน Original แยกก็ได้
     ColourframeORI = image.copy()
     ctx["frame"] = ColourframeORI
+    head_xy_out = (head[0], head[1]) if head else None
+    tail_xy_out = (tail[0], tail[1]) if tail else None
+    return (
+        ColourframeORI,
+        ColourframeBEV,
+        mask_head,
+        mask_tail,
+        head_xy_out,
+        tail_xy_out,
+    )
 
     return ColourframeORI, ColourframeBEV, mask_head, mask_tail
 
@@ -559,30 +731,30 @@ def draw_colour_mask(frame, frame_bev):
 
 # cap = cv2.VideoCapture("./footage.mp4")
 # cap = cv2.VideoCapture(0)
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 
-# cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
-# cv2.namedWindow("Original")
-# cv2.setMouseCallback("Original", on_mouse)
-# while True:
-#     ret, image = cap.read()
-#     scale = 0.8  # ย่อ 50%
-#     if not ret:
-#         # ถ้าอ่านเฟรมไม่สำเร็จ (วิดีโอจบแล้ว)
-#         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # ย้อนกลับไปเฟรมแรก
-#         continue
+cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
+cv2.namedWindow("Original")
+cv2.setMouseCallback("Original", on_mouse)
+while True:
+    ret, image = cap.read()
+    scale = 0.8  # ย่อ 50%
+    if not ret:
+        # ถ้าอ่านเฟรมไม่สำเร็จ (วิดีโอจบแล้ว)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # ย้อนกลับไปเฟรมแรก
+        continue
 
-#     # image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
-#     out = draw_overlay(image, clicks)
-#     cv2.imshow("Original", out)
-#     k = cv2.waitKey(1) & 0xFF
-#     if k == ord("c"):
-#         clicks = []
-#     if k == ord("q") and len(clicks) == 4:
-#         break
+    # image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
+    out = draw_overlay(image, clicks)
+    cv2.imshow("Original", out)
+    k = cv2.waitKey(1) & 0xFF
+    if k == ord("c"):
+        clicks = []
+    if k == ord("q") and len(clicks) == 4:
+        break
 
 cv2.destroyAllWindows()
-# print(clicks)
+print(clicks)
 pts = np.array(clicks, dtype="float32")
 rect = order_points(pts)
 dst_bev = np.array(
@@ -604,8 +776,10 @@ cv2.setMouseCallback("Original Cap", on_mouse_colour, ctx)
 clicked_hsv = None
 
 
-head_colour = np.array([104, 239, 255], dtype=np.uint8)
-tail_colour = np.array([232, 102, 115], dtype=np.uint8)
+# head_colour = np.array([160, 255, 224], dtype=np.uint8)
+# tail_colour = np.array([115, 98, 233], dtype=np.uint8)
+head_colour = np.array([79, 184, 165], dtype=np.uint8)
+tail_colour = np.array([61, 54, 123], dtype=np.uint8)
 K3 = np.ones((3, 3), np.uint8)
 K5 = np.ones((5, 5), np.uint8)
 
@@ -626,39 +800,6 @@ def img_to_bev_point(cx, cy, H, bev_w, bev_h):
     return xw, yw, inside
 
 
-def overlay_duck_on_bev(bev_img, dets, H, bev_w, bev_h):
-    ColourframeBEV = bev_img.copy()
-    for d in dets:
-        cx, cy = d["cx"], d["cy"]
-        if H is None:
-            continue
-        xw, yw, ok = img_to_bev_point(cx, cy, H, BEV_W, BEV_H)
-        if not ok:
-            continue
-        Xm, Ym = dist_m(xw, yw, PX_PER_M)
-
-        # draw on BEV
-        cv2.drawMarker(
-            ColourframeBEV,
-            (int(round(xw)), int(round(yw))),
-            (0, 255, 255),
-            cv2.MARKER_TILTED_CROSS,
-            16,
-            2,
-        )
-        txt = f"{d['cls_name']} {d['conf']:.2f}  W({Xm:.2f}m,{Ym:.2f}m)"
-        cv2.putText(
-            ColourframeBEV,
-            txt,
-            (int(xw) + 8, int(yw) - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-    return ColourframeBEV
-
-
 while True:
     ret, image = cap.read()
     if not ret:
@@ -668,48 +809,34 @@ while True:
     # image, mask, res = draw_colour_mask(image)
     # image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
     # cv2.imshow("debug", image)
-    dets, anno = detect_duck_targets(image, model, conf_th=0.40)
     warped = warp_to_bev(image)
     # overlay_duck_on_bev(warped, dets, H, BEV_H, BEV_H)
-
-    ColourframeBEV = (
-        cv2.warpPerspective(image, H, (BEV_W, BEV_H)) if H is not None else image.copy()
-    )
-    for d in dets:
-        cx, cy = d["cx"], d["cy"]
-        if H is None:
-            continue
-        xw, yw, ok = img_to_bev_point(cx, cy, H, BEV_W, BEV_H)
-        if not ok:
-            continue
-        Xm, Ym = dist_m(xw, yw, PX_PER_M)
-
-        # draw on BEV
-        cv2.drawMarker(
-            ColourframeBEV,
-            (int(round(xw)), int(round(yw))),
-            (0, 255, 255),
-            cv2.MARKER_TILTED_CROSS,
-            16,
-            2,
-        )
-        txt = f"{d['cls_name']} {d['conf']:.2f}  W({Xm:.2f}m,{Ym:.2f}m)"
-        cv2.putText(
-            ColourframeBEV,
-            txt,
-            (int(xw) + 8, int(yw) - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2,
-        )
-
+    # annot, duck_xy_img, duck_xy_bev, duck_xy_m = duck_detector(
+    #     image,
+    #     H,
+    #     BEV_W,
+    #     BEV_H,
+    #     PX_PER_M,
+    #     cls_whitelist=None,  # ระบุ class id ของ "เป็ด" ได้ถ้าต้อง
+    # )
+    warped = draw_sticky_target_on_bev(warped)
+    # cv2.imshow("bev_out", bev_out)
     # _, _, warped = ArucoDetector(warped)
     # scale_warped = 0.7
     # warped = cv2.resize(warped, (0, 0), fx=scale_warped, fy=scale_warped)
 
     # color, mask, res, warped = draw_colour_mask(image, warped)
-    color, warped, mask_head, mask_tail = process_frame(image, warped, BEV_W, BEV_H)
+    # color, warped, mask_head, mask_tail = process_frame(image, warped, BEV_W, BEV_H)
+
+    color, warped, mask_head, mask_tail, head_xy_bev, tail_xy_bev = process_frame(
+        image, warped, BEV_W, BEV_H
+    )
+    # ใช้ yaw_ema ที่คุณคำนวณอยู่แล้วใน process_frame
+    curr_yaw = yaw_ema  # ถ้าอยากใช้แบบดิบ ให้ใช้ 'yaw' ที่คำนวณก่อน EMA
+
+    # สั่งควบคุมอัตโนมัติ: หมุนอยู่กับที่ให้หัวหันไปหาเป้าหมาย แล้วเดินหน้า
+    # autopilot_step(head_xy_bev, tail_xy_bev, curr_yaw, target_bev_px)
+
     cv2.imshow("Warped", warped)
     # canvas = draw_line(color)
     cv2.polylines(color, [rect.astype(np.int32)], True, (0, 200, 0), 2, cv2.LINE_AA)

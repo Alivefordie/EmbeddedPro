@@ -5,7 +5,7 @@ import sys
 import time
 
 # ==== ตั้งค่าพอร์ต ====
-PORT = "COM10"  # Windows เช่น "COM7"
+PORT = "COM11"  # Windows เช่น "COM7"
 # PORT = "/dev/cu.ESP32-SPP-xxxx"   # macOS
 # PORT = "/dev/rfcomm0"             # Linux (หลัง bind ด้วย rfcomm)
 BAUD = 115200  # สำหรับ SPP ใส่เป็นพิธี (ค่าจริงไม่กระทบ)

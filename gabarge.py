@@ -8,7 +8,7 @@ import time
 import serial
 
 # ==== Serial to boat MCU (Bluetooth) ====
-PORT = "COM10"  # ปรับตามเครื่องคุณ (Linux/Mac ใช้ /dev/tty.*)
+PORT = "COM11"  # ปรับตามเครื่องคุณ (Linux/Mac ใช้ /dev/tty.*)
 BAUD = 115200
 TIMEOUT_S = 0.05
 
@@ -20,7 +20,7 @@ FWD_PWM_BASE = 130  # ความแรงเดินหน้าเริ่�
 ROT_PWM_BASE = 120  # ความแรงหมุนเริ่มต้น
 K_ROT = 1.0  # สเกล PWM ตามขนาด error องศา
 ANGLE_TOL_DEG = 8.0  # ยอมให้เอียงได้เท่านี้แล้วเดินหน้า
-STOP_DIST_M = 0.05  # ระยะหยุด (เมตร) เมื่อถึงเป้าหมาย
+STOP_DIST_M = 0.2  # ระยะหยุด (เมตร) เมื่อถึงเป้าหมาย
 
 
 # 1) Pick device automatically: CUDA if available (your RTX 1650), else CPU
@@ -28,7 +28,7 @@ device = 0 if torch.cuda.is_available() else "cpu"
 
 # 2) Load a small pretrained model (auto-downloads on first run)
 model = YOLO("./best.pt")  # 'n' = nano, fastest
-clicks = [(237, 346), (250, 135), (512, 166), (516, 403)]
+clicks = [(20, 454), (224, 129), (768, 119), (632, 485)]
 boat_cx, boat_cy = -1, -1  # เริ่มต้นยังไม่รู้ตำแหน่งเรือ
 H = None  # matrix แปลงมุมมอง
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -41,8 +41,12 @@ BEV_W = int(round(REAL_W * PX_PER_M))
 BEV_H = int(round(REAL_H * PX_PER_M))
 
 # --- state สำหรับเก็บ "จุดหมาย" ---
-target_bev_px = None  # (xw, yw) บน BEV (px)
-target_bev_m = None  # (Xm, Ym) บน BEV (m)
+# target_bev_px = None  # (xw, yw) บน (px)
+# target_bev_m = None  # (Xm, Ym) บน BEV (m)BEV
+target_bev_px = (662.9, 509.9)  # (xw, yw) บน BEV (px)
+target_bev_m = (2.21, 1.70)  # (Xm, Ym) บน BEV (m)
+
+TURN_INVERTED = False  # ถ้าหมุนกลับด้านอยู่ ให้ตั้ง True
 
 
 def clamp_pwm(v):
@@ -113,12 +117,18 @@ def autopilot_step(head_xy_bev, tail_xy_bev, yaw_deg, target_bev_px):
         or yaw_deg is None
     ):
         send_stop()
+
         return
 
     # ระยะถึงเป้าหมาย
-    dist = dist_m_px(tail_xy_bev, target_bev_px, PX_PER_M)
+    dist = dist_m_px(head_xy_bev, target_bev_px, PX_PER_M)
     if dist < STOP_DIST_M:
+        print(f"At target (dist={dist:.2f}m) → STOP")
         send_stop()
+        time.sleep(0.1)
+        rate_limited_send("SOUND-0")
+        time.sleep(0.1)
+        # rate_limited_send("DROP-0")
         return
 
     # มุมที่ควรเผชิญหน้า (bearing) และ error
@@ -128,9 +138,14 @@ def autopilot_step(head_xy_bev, tail_xy_bev, yaw_deg, target_bev_px):
     # ถ้าเอียงมาก → หมุนอยู่กับที่
     if abs(err) > ANGLE_TOL_DEG:
         pwm = ROT_PWM_BASE + K_ROT * abs(err)  # เพิ่มแรงตาม error
-        if err > 0:  # ต้องหมุนทวนเข็ม (yaw ต้องเพิ่ม) → สั่ง Left
+        turn_left = err > 0  # ค่านี้คือทิศทางตามคณิตศาสตร์ปัจจุบัน
+
+        if TURN_INVERTED:
+            turn_left = not turn_left
+
+        if turn_left:
             send_left(pwm)
-        else:  # ต้องหมุนตามเข็ม (yaw ต้องลด)   → สั่ง Right
+        else:
             send_right(pwm)
         return
 
@@ -428,9 +443,10 @@ def inrange_hsv_with_wrap(hsv_img, lower, upper):
 
 
 def on_mouse_colour(event, x, y, flags, param):
-    global head_colour, clicked_hsv
+    global head_colour, clicked_hsv, target_bev_px, target_bev_m
+
+    # ซ้ายคลิก: เลือกสีสำหรับ marker (ของเดิม)
     if event == cv2.EVENT_LBUTTONDOWN and param["frame"] is not None:
-        # ดึงสี BGR จากจุดคลิก แล้วตั้งเป็นเป้าหมายใหม่
         bgr = param["frame"][y, x, :].astype(np.uint8)
         head_colour = bgr
         hsv_pix = cv2.cvtColor(np.array([[bgr]], dtype=np.uint8), cv2.COLOR_BGR2HSV)[
@@ -440,6 +456,24 @@ def on_mouse_colour(event, x, y, flags, param):
         print(
             f"Picked BGR={tuple(int(v) for v in bgr)}, HSV={tuple(int(v) for v in hsv_pix)}"
         )
+
+    # ขวาคลิก: กำหนด "จุดหมาย" จากจุดที่คลิก (Original -> BEV)
+    elif event == cv2.EVENT_RBUTTONDOWN:
+        if H is None:
+            print("WARN: Homography H ยังไม่พร้อม ไม่สามารถตั้งจุดหมายได้")
+            return
+
+        # ใช้ helper ที่คุณมีอยู่แล้วจะสะดวก/ปลอดภัยกว่า
+        xw, yw, inside = img_to_bev_point(x, y, H, BEV_W, BEV_H)
+        if not inside:
+            print(f"WARN: จุดที่คลิก ({x},{y}) project แล้วอยู่นอก BEV: ({xw:.1f},{yw:.1f})")
+            return
+
+        Xm, Ym = xw / PX_PER_M, yw / PX_PER_M
+        target_bev_px = (xw, yw)
+        target_bev_m = (Xm, Ym)
+
+        print(f"Set TARGET from click: BEV({xw:.1f},{yw:.1f})  W({Xm:.2f},{Ym:.2f}) m")
 
 
 def largest_centroid_from_mask(mask, min_area=400):
@@ -772,8 +806,8 @@ cv2.setMouseCallback("Original Cap", on_mouse_colour, ctx)
 clicked_hsv = None
 
 
-head_colour = np.array([89, 62, 112], dtype=np.uint8)
-tail_colour = np.array([123, 59, 42], dtype=np.uint8)
+head_colour = np.array([79, 184, 165], dtype=np.uint8)
+tail_colour = np.array([61, 54, 123], dtype=np.uint8)
 K3 = np.ones((3, 3), np.uint8)
 K5 = np.ones((5, 5), np.uint8)
 
@@ -805,14 +839,14 @@ while True:
     # cv2.imshow("debug", image)
     warped = warp_to_bev(image)
     # overlay_duck_on_bev(warped, dets, H, BEV_H, BEV_H)
-    annot, duck_xy_img, duck_xy_bev, duck_xy_m = duck_detector(
-        image,
-        H,
-        BEV_W,
-        BEV_H,
-        PX_PER_M,
-        cls_whitelist=None,  # ระบุ class id ของ "เป็ด" ได้ถ้าต้อง
-    )
+    # annot, duck_xy_img, duck_xy_bev, duck_xy_m = duck_detector(
+    #     image,
+    #     H,
+    #     BEV_W,
+    #     BEV_H,
+    #     PX_PER_M,
+    #     cls_whitelist=None,  # ระบุ class id ของ "เป็ด" ได้ถ้าต้อง
+    # )
     warped = draw_sticky_target_on_bev(warped)
     # cv2.imshow("bev_out", bev_out)
     # _, _, warped = ArucoDetector(warped)
@@ -840,6 +874,9 @@ while True:
     k = cv2.waitKey(1) & 0xFF
     if k == ord("q"):
         break
+    elif k == ord("t"):
+        tail_colour = head_colour.copy()
+        print(f"Set tail colour to {tail_colour}")
 
 # show the original and warped images
 cv2.destroyAllWindows()
