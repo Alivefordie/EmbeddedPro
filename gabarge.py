@@ -20,15 +20,15 @@ FWD_PWM_BASE = 130  # ความแรงเดินหน้าเริ่�
 ROT_PWM_BASE = 120  # ความแรงหมุนเริ่มต้น
 K_ROT = 1.0  # สเกล PWM ตามขนาด error องศา
 ANGLE_TOL_DEG = 8.0  # ยอมให้เอียงได้เท่านี้แล้วเดินหน้า
-STOP_DIST_M = 0.2  # ระยะหยุด (เมตร) เมื่อถึงเป้าหมาย
-
+STOP_DIST_M = 0.3  # ระยะหยุด (เมตร) เมื่อถึงเป้าหมาย
+ENDING = False
 
 # 1) Pick device automatically: CUDA if available (your RTX 1650), else CPU
 device = 0 if torch.cuda.is_available() else "cpu"
 
 # 2) Load a small pretrained model (auto-downloads on first run)
 model = YOLO("./best.pt")  # 'n' = nano, fastest
-clicks = [(20, 454), (224, 129), (768, 119), (632, 485)]
+clicks = [(114, 408), (273, 104), (652, 117), (634, 439)]
 boat_cx, boat_cy = -1, -1  # เริ่มต้นยังไม่รู้ตำแหน่งเรือ
 H = None  # matrix แปลงมุมมอง
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -48,16 +48,23 @@ target_bev_m = (2.21, 1.70)  # (Xm, Ym) บน BEV (m)
 
 TURN_INVERTED = False  # ถ้าหมุนกลับด้านอยู่ ให้ตั้ง True
 
+ARRIVE_COOLDOWN_S = 3.0
+arrived_until = 0.0
+arrived_actions_done = False
+
 
 def clamp_pwm(v):
     return max(0, min(int(round(v)), MAX_PWM))
 
 
-def rate_limited_send(cmd):
-    global last_send
+def rate_limited_send(cmd: str, force: bool = False):
+    global last_send, ser
     t = time.time()
-    if t - last_send >= (1.0 / SEND_HZ):
-        ser.write((cmd + "\n").encode("utf-8"))
+    if force or (t - last_send) >= (1.0 / SEND_HZ):
+        if ser and ser.is_open:
+            ser.write((cmd + "\n").encode("utf-8"))
+        else:
+            print(f"[DRYRUN] {cmd}")
         last_send = t
 
 
@@ -79,6 +86,14 @@ def send_left(p):
 def send_right(p):
     print(f"RIGHT {p}")
     rate_limited_send(f"R-{clamp_pwm(p)}")  # หมุนขวาอยู่กับที่
+
+
+def send_sound():
+    rate_limited_send("SOUND-0")
+
+
+def send_drop():
+    rate_limited_send("DROP-0")
 
 
 def ang_wrap_deg(a):
@@ -103,6 +118,19 @@ def dist_m_px(a_px, b_px, px_per_m=PX_PER_M):
     return (dx * dx + dy * dy) ** 0.5
 
 
+def now():
+    return time.time()
+
+
+def can_trigger_arrival():
+    return now() >= _arrived_until
+
+
+def set_arrival_cooldown(sec=ARRIVE_COOLDOWN_S):
+    global _arrived_until
+    _arrived_until = now() + sec
+
+
 def autopilot_step(head_xy_bev, tail_xy_bev, yaw_deg, target_bev_px):
     """
     head_xy_bev, tail_xy_bev: tuple(int,int) พิกัด BEV (px)
@@ -123,12 +151,29 @@ def autopilot_step(head_xy_bev, tail_xy_bev, yaw_deg, target_bev_px):
     # ระยะถึงเป้าหมาย
     dist = dist_m_px(head_xy_bev, target_bev_px, PX_PER_M)
     if dist < STOP_DIST_M:
-        print(f"At target (dist={dist:.2f}m) → STOP")
-        send_stop()
-        time.sleep(0.1)
-        rate_limited_send("SOUND-0")
-        time.sleep(0.1)
-        # rate_limited_send("DROP-0")
+        global arrived_until, arrived_actions_done
+        now = time.time()
+
+        # เพิ่งถึง (ครั้งแรก)
+        if not arrived_actions_done:
+            print(f"At target (dist={dist:.2f} m) → STOP + SOUND + DROP")
+            send_stop()
+            rate_limited_send("SOUND-0", force=True)
+            rate_limited_send("DROP-0", force=True)
+            # rate_limited_send("LOCK-0", force=True)
+
+            arrived_actions_done = True
+            arrived_until = now + ARRIVE_COOLDOWN_S
+            ENDING = True  # ให้โปรแกรมหลักออก
+
+        # อยู่ในช่วงคูลดาวน์: แค่หยุด
+        elif now < arrived_until:
+            send_stop()
+
+        # หมดคูลดาวน์: reset state
+        else:
+            arrived_actions_done = False
+
         return
 
     # มุมที่ควรเผชิญหน้า (bearing) และ error
@@ -839,14 +884,14 @@ while True:
     # cv2.imshow("debug", image)
     warped = warp_to_bev(image)
     # overlay_duck_on_bev(warped, dets, H, BEV_H, BEV_H)
-    # annot, duck_xy_img, duck_xy_bev, duck_xy_m = duck_detector(
-    #     image,
-    #     H,
-    #     BEV_W,
-    #     BEV_H,
-    #     PX_PER_M,
-    #     cls_whitelist=None,  # ระบุ class id ของ "เป็ด" ได้ถ้าต้อง
-    # )
+    annot, duck_xy_img, duck_xy_bev, duck_xy_m = duck_detector(
+        image,
+        H,
+        BEV_W,
+        BEV_H,
+        PX_PER_M,
+        cls_whitelist=None,  # ระบุ class id ของ "เป็ด" ได้ถ้าต้อง
+    )
     warped = draw_sticky_target_on_bev(warped)
     # cv2.imshow("bev_out", bev_out)
     # _, _, warped = ArucoDetector(warped)
@@ -872,12 +917,12 @@ while True:
     # cv2.imshow("Target Mask", mask)
     # cv2.imshow("Target Detection", res)
     k = cv2.waitKey(1) & 0xFF
-    if k == ord("q"):
+    if k == ord("q") or ENDING:
         break
     elif k == ord("t"):
         tail_colour = head_colour.copy()
         print(f"Set tail colour to {tail_colour}")
 
 # show the original and warped images
-cv2.destroyAllWindows()
+# cv2.destroyAllWindows()
 cap.release()

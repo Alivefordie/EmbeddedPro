@@ -53,6 +53,7 @@ def main():
         while True:
             # prompt ผู้ใช้
             cmd = input("> ").strip()
+            # cmd = "DROP-0"
             if not cmd:
                 continue
             # ส่งพร้อม newline ให้เข้ากับโค้ด ESP32 ที่ใช้ readStringUntil('\n')
