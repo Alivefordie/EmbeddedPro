@@ -67,6 +67,7 @@ def rate_limited_send(cmd: str, force: bool = False):
     t = time.time()
     if force or (t - last_send) >= (1.0 / SEND_HZ):
         if ser and ser.is_open:
+            print(f"[SEND] {cmd}")
             ser.write((cmd + "\n").encode("utf-8"))
         else:
             print(f"[DRYRUN] {cmd}")
@@ -74,22 +75,18 @@ def rate_limited_send(cmd: str, force: bool = False):
 
 
 def send_stop():
-    print("STOP")
     rate_limited_send("S-0")
 
 
 def send_forward(p):
-    print(f"FWD {p}")
     rate_limited_send(f"F-{clamp_pwm(p)}")
 
 
 def send_left(p):
-    print(f"LEFT {p}")
     rate_limited_send(f"L-{clamp_pwm(p)}")  # หมุนซ้ายอยู่กับที่
 
 
 def send_right(p):
-    print(f"RIGHT {p}")
     rate_limited_send(f"R-{clamp_pwm(p)}")  # หมุนขวาอยู่กับที่
 
 
@@ -608,7 +605,7 @@ def mask_hsv(bgr, lo, hi):
 
 
 # cap = cv2.VideoCapture("./footage.mp4")
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 
 cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
 cv2.namedWindow("Original")
@@ -695,7 +692,6 @@ while True:
     autopilot_step(head_xy_bev, tail_xy_bev, curr_yaw, target_bev_px)
 
     cv2.imshow("Warped", warped)
-    # canvas = draw_line(color)
     cv2.polylines(color, [rect.astype(np.int32)], True, (0, 200, 0), 2, cv2.LINE_AA)
     cv2.imshow("Original Cap", color)
     k = cv2.waitKey(1) & 0xFF
